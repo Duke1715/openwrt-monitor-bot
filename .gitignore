@@ -1,0 +1,15 @@
+# Local config copies (never commit secrets)
+config.sh
+config.local.sh
+*.conf
+
+# Custom unauthorized image
+assets/unauthorized.jpg
+!assets/unauthorized.jpg.example
+
+# macOS / editor cruft
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

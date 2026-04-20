@@ -1,0 +1,8 @@
+Place any JPEG here as `unauthorized.jpg` and the installer will offer
+to install it to `/usr/local/share/wrt-monitor-unauthorized.jpg`.
+
+The bot will send this image to anyone who tries to use it without
+being the configured CHAT_ID. If no image is set, it sends
+UNAUTHORIZED_TEXT from config instead.
+
+Good candidates: meme images, "access denied" cards, etc.

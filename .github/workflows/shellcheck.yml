@@ -1,0 +1,37 @@
+name: shell
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax:
+    name: sh -n (dash POSIX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dash
+        run: sudo apt-get update && sudo apt-get install -y dash
+      - name: Check bot.sh
+        run: dash -n bot.sh
+      - name: Check install.sh
+        run: dash -n install.sh
+      - name: Check init script
+        run: dash -n wrt-monitor-bot.init
+      - name: Check config.example.sh
+        run: dash -n config.example.sh
+
+  shellcheck:
+    name: shellcheck (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run shellcheck
+        run: |
+          shellcheck -s sh bot.sh install.sh config.example.sh || true
+          # init uses OpenWrt rc.common syntax; /bin/sh /etc/rc.common
+          # is not a standard shell interpretation — skip strict check.
