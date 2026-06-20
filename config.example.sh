@@ -111,6 +111,14 @@ ALERT_THROTTLE=600
 # WG peer is considered online if last handshake was within this many seconds.
 WG_HANDSHAKE_TIMEOUT=180
 
+# Consecutive "inactive" checks before declaring a peer offline.
+# WireGuard refreshes handshake only on rekey (~120s), so a single stale
+# reading is not enough — without hysteresis you'd get false offline→online
+# flapping during quiet periods. With ALERT_INTERVAL=30s and 3 misses the
+# bot waits ~90s of total silence (handshake stale AND no byte delta)
+# before sending "disconnected".
+WG_OFFLINE_MISSES=3
+
 # Cache TTL for external IP lookup (seconds).
 CACHE_TTL_EXT_IP=300
 
