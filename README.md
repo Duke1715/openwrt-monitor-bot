@@ -185,6 +185,7 @@ service wrt-monitor-bot restart
 | `ALERT_TEMP_THRESHOLD` | `80` | CPU °C to trigger alert |
 | `ALERT_THROTTLE` | `600` | Min seconds between same alerts |
 | `WG_HANDSHAKE_TIMEOUT` | `180` | Peer online if handshake within N sec |
+| `WG_OFFLINE_MISSES` | `3` | Consecutive inactive checks before "disconnected" fires (hysteresis) |
 
 ### Speedtest
 
@@ -230,6 +231,7 @@ Without a description the bot shows the UCI section name, or `Unknown`.
 - **Alert throttle** — RAM/temp alerts rate-limited by `ALERT_THROTTLE` (default 10 min) to avoid spam
 - **`curl` timeouts** — `--max-time 15` for getUpdates (long-poll=10 + margin), `--max-time 5` for external IP, `--max-time 15` for speedtest phases.
 - **Recovery alerts** — VPN sends an explicit "recovered" notification when the process comes back. RAM/temp alerts do not send a "normalized" notification — they rely on `ALERT_THROTTLE` to stop firing once conditions improve (intentionally asymmetric to reduce notification noise on flapping thresholds).
+- **WG peer state machine** — connect/disconnect detection tracks each peer's `online`/`offline` state in `${STATE_DIR}/wrt_bot_wg_state`. A peer counts as "active right now" if **either** the latest handshake is younger than `WG_HANDSHAKE_TIMEOUT` **or** rx/tx bytes increased since the previous check. Online→offline transition requires `WG_OFFLINE_MISSES` consecutive inactive checks (hysteresis). This prevents false flapping during quiet periods, since WireGuard refreshes `latest handshake` only on rekey (~120s), not on every keepalive packet.
 
 Memory footprint: ~1.5 MB RSS (busybox `sh` + a few curl invocations).
 

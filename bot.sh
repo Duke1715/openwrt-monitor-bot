@@ -40,6 +40,7 @@ ALERT_INTERVAL="${ALERT_INTERVAL:-30}"
 ALERT_RAM_THRESHOLD="${ALERT_RAM_THRESHOLD:-90}"
 ALERT_TEMP_THRESHOLD="${ALERT_TEMP_THRESHOLD:-80}"
 WG_HANDSHAKE_TIMEOUT="${WG_HANDSHAKE_TIMEOUT:-180}"
+WG_OFFLINE_MISSES="${WG_OFFLINE_MISSES:-3}"
 CACHE_TTL_EXT_IP="${CACHE_TTL_EXT_IP:-300}"
 CACHE_TTL_PEER="${CACHE_TTL_PEER:-300}"
 ALERT_THROTTLE="${ALERT_THROTTLE:-600}"
@@ -54,8 +55,10 @@ OFFSET_FILE="${STATE_DIR}/wrt_bot_offset"
 INTRUDERS_LOG="${STATE_DIR}/wrt_bot_intruders.log"
 WG_SNAPSHOT="${STATE_DIR}/wrt_bot_wg_snapshot"
 EXT_IP_CACHE="${STATE_DIR}/wrt_bot_ext_ip"
-WG_PEERS_PREV="${STATE_DIR}/wrt_bot_wg_peers_prev"
 WG_PEERS_NOW="${STATE_DIR}/wrt_bot_wg_peers_now"
+# State machine for WG online/offline notifications.
+# Format per line: <pubkey>|<state 0|1>|<last_rx>|<last_tx>|<misses>
+WG_STATE_FILE="${STATE_DIR}/wrt_bot_wg_state"
 TG_RESPONSE_FILE="${STATE_DIR}/wrt_bot_tg_response.json"
 ALERT_FLAG_RAM="${STATE_DIR}/wrt_bot_alert_ram"
 ALERT_FLAG_TEMP="${STATE_DIR}/wrt_bot_alert_temp"
@@ -630,30 +633,93 @@ check_alerts() {
         fi
     fi
 
-    # WG peer connect/disconnect
-    wg show "$WG_IFACE" dump 2>/dev/null | awk -F'\t' 'NR>1{print $1"|"$5}' > "$WG_PEERS_NOW"
-    if [ -f "$WG_PEERS_PREV" ] && [ -s "$WG_PEERS_NOW" ]; then
-        while IFS='|' read -r pubkey hs; do
-            local prev_hs name
-            prev_hs=$(grep "^${pubkey}|" "$WG_PEERS_PREV" | cut -d'|' -f2)
-            name=$(get_peer_name "$pubkey")
+    # WG peer connect/disconnect — state machine with hysteresis.
+    #
+    # A peer is considered "active right now" if EITHER:
+    #   (a) latest handshake is younger than WG_HANDSHAKE_TIMEOUT, OR
+    #   (b) rx/tx bytes increased since the previous check.
+    #
+    # WireGuard updates `latest handshake` only on rekey (~every 2 min),
+    # so relying on handshake alone causes false offline→online flapping
+    # during quiet periods. Tracking bytes catches keepalive traffic too.
+    #
+    # State transitions:
+    #   offline → online: fire "connected" on first active signal.
+    #   online → offline: only after WG_OFFLINE_MISSES consecutive
+    #                     inactive checks (hysteresis), then fire "disconnected".
+    wg show "$WG_IFACE" dump 2>/dev/null \
+        | awk -F'\t' 'NR>1{print $1"|"$5"|"$6"|"$7}' > "$WG_PEERS_NOW"
 
-            # Connected
-            if [ "$hs" != "0" ] && [ -n "$hs" ] && [ $((now - hs)) -lt "$WG_HANDSHAKE_TIMEOUT" ]; then
-                if [ -z "$prev_hs" ] || [ "$prev_hs" = "0" ] || [ $((now - prev_hs)) -ge "$WG_HANDSHAKE_TIMEOUT" ]; then
+    if [ -s "$WG_PEERS_NOW" ]; then
+        : > "${WG_STATE_FILE}.new"
+        while IFS='|' read -r pubkey hs rx tx; do
+            [ -z "$pubkey" ] && continue
+            local prev_state prev_rx prev_tx prev_misses
+            local active is_first new_state new_misses name
+
+            # Read previous state for this peer (if any)
+            local prev_line
+            prev_line=$(grep "^${pubkey}|" "$WG_STATE_FILE" 2>/dev/null | head -1)
+            if [ -n "$prev_line" ]; then
+                prev_state=$(echo "$prev_line" | cut -d'|' -f2)
+                prev_rx=$(echo "$prev_line" | cut -d'|' -f3)
+                prev_tx=$(echo "$prev_line" | cut -d'|' -f4)
+                prev_misses=$(echo "$prev_line" | cut -d'|' -f5)
+                is_first=0
+            else
+                prev_state=0
+                prev_rx=0
+                prev_tx=0
+                prev_misses=0
+                is_first=1
+            fi
+
+            # Determine activity: fresh handshake OR bytes increased
+            active=0
+            if [ -n "$hs" ] && [ "$hs" != "0" ] && [ $((now - hs)) -lt "$WG_HANDSHAKE_TIMEOUT" ]; then
+                active=1
+            elif [ -n "$rx" ] && [ -n "$tx" ] \
+                && { [ "$rx" -gt "$prev_rx" ] 2>/dev/null || [ "$tx" -gt "$prev_tx" ] 2>/dev/null; }; then
+                active=1
+            fi
+
+            new_state="$prev_state"
+            new_misses="$prev_misses"
+
+            if [ "$active" = "1" ]; then
+                new_misses=0
+                if [ "$prev_state" != "1" ] && [ "$is_first" = "0" ]; then
+                    name=$(get_peer_name "$pubkey")
                     send_ntfy "WG: connected" "${name}" "low" "green_circle,iphone"
                 fi
-            fi
-
-            # Disconnected
-            if [ "$hs" = "0" ] || [ -z "$hs" ] || [ $((now - hs)) -ge "$WG_HANDSHAKE_TIMEOUT" ]; then
-                if [ -n "$prev_hs" ] && [ "$prev_hs" != "0" ] && [ $((now - prev_hs)) -lt "$WG_HANDSHAKE_TIMEOUT" ]; then
-                    send_ntfy "WG: disconnected" "${name}" "min" "white_circle,iphone"
+                new_state=1
+            else
+                if [ "$prev_state" = "1" ]; then
+                    new_misses=$((prev_misses + 1))
+                    if [ "$new_misses" -ge "$WG_OFFLINE_MISSES" ]; then
+                        name=$(get_peer_name "$pubkey")
+                        send_ntfy "WG: disconnected" "${name}" "min" "white_circle,iphone"
+                        new_state=0
+                        new_misses=0
+                    fi
+                else
+                    new_state=0
+                    new_misses=0
                 fi
             fi
+
+            # Bootstrap state silently on first run (no notification)
+            if [ "$is_first" = "1" ]; then
+                new_state="$active"
+                new_misses=0
+            fi
+
+            printf '%s|%s|%s|%s|%s\n' "$pubkey" "$new_state" "${rx:-0}" "${tx:-0}" "$new_misses" \
+                >> "${WG_STATE_FILE}.new"
         done < "$WG_PEERS_NOW"
+
+        mv "${WG_STATE_FILE}.new" "$WG_STATE_FILE"
     fi
-    [ -s "$WG_PEERS_NOW" ] && cp "$WG_PEERS_NOW" "$WG_PEERS_PREV"
 
     # Reset reboot confirmation (fired by the 30s auto-cancel timer)
     if [ -f "$REBOOT_CANCEL_FILE" ]; then
@@ -678,8 +744,24 @@ else
     echo "$OFFSET" > "$OFFSET_FILE"
 fi
 
-# Init WG peer tracking
-wg show "$WG_IFACE" dump 2>/dev/null | awk -F'\t' 'NR>1{print $1"|"$5}' > "$WG_PEERS_PREV" 2>/dev/null
+# Init WG peer state on startup. If a state file already exists (warm restart),
+# keep it — preserves prior online/offline state across bot restarts. Otherwise
+# seed silently from the current dump so no false "connected" alerts fire on boot.
+if [ ! -f "$WG_STATE_FILE" ]; then
+    # Seed conservatively: any peer with ever-observed activity
+    # (non-zero handshake OR rx/tx > 0) starts as "online" to avoid
+    # firing a spurious "connected" alert on the first tick.
+    # Truly offline peers (never handshaked, zero counters) start at 0.
+    # If a peer is actually offline, WG_OFFLINE_MISSES ticks of silence
+    # will reconcile state correctly.
+    wg show "$WG_IFACE" dump 2>/dev/null \
+        | awk -F'\t' '
+            NR>1 {
+                hs=$5; rx=$6; tx=$7
+                state=(hs!="0" && hs!="" || rx+0>0 || tx+0>0) ? 1 : 0
+                printf "%s|%d|%s|%s|0\n", $1, state, rx, tx
+            }' > "$WG_STATE_FILE" 2>/dev/null
+fi
 
 send_msg "🚀 <b>OpenWrt Monitor started</b>
 Send /help for commands"
